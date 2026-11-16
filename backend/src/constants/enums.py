@@ -1,0 +1,5 @@
+ROLES=('admin','analyst','viewer')
+STATES=('queued','running','done','failed')
+DIMENSIONS=('venue','play','channel','month')
+VENUES=('云幕大剧场','河畔小剧场','星光排练厅')
+CHANNELS=('剧院直营','票务合作','团体专场')

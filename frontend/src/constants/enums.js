@@ -1,0 +1,1 @@
+export const DIMENSIONS=[['venue','场馆'],['play','演出'],['channel','渠道'],['month','月份']];export const VENUES=['云幕大剧场','河畔小剧场','星光排练厅'];export const CHANNELS=['剧院直营','票务合作','团体专场'];export const ROLES=['admin','analyst','viewer'];export const STATES=['queued','running','done','failed'];
