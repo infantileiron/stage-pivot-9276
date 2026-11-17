@@ -6,7 +6,7 @@
 
 云幕剧院有云幕大剧场、河畔小剧场和星光排练厅。财务组当前把 `云幕_场次结算_20261115.xlsx` 中多张表复制到工作簿，再按场馆和渠道求和，最后在邮件里解释回单差异。痛点是座位百分比被简单平均、分币四舍五入不守恒、原始明细改动后难以重现旧结论。上游是独立场次票款及核验记录；本项目替代布局、计算、追溯及复核；下游是财务负责人核对渠道回单，不触发付款。
 
-四页：结算明细（录入/修订）、透视布局（白名单行列方案）、结算透视（守恒总计/冻结下钻/导出）、差异复核（回单预期/原因/签核）。三核心实体 Settlement、Pivot、Review，另有User/Audit。每条记录为独立场次，渠道是主售票渠道；当前不拆分同一场次的多个售票渠道座位。
+五页：结算明细（录入/修订）、凭证与补账（交叉推导/冲突/入账）、透视布局（白名单行列方案）、结算透视（守恒总计/冻结下钻/导出）、差异复核（回单预期/原因/签核）。三核心实体 Settlement、Pivot、Review，另有 Voucher（交叉汇总凭证）、Backfill（补账任务）、User/Audit。每条记录为独立场次，渠道是主售票渠道；当前不拆分同一场次的多个售票渠道座位。
 
 |角色|权限|动作|
 |---|---|---|
@@ -24,6 +24,21 @@ docker compose exec -T backend python -m scripts.seed_demo
 ```
 
 前端 [localhost:18211](http://localhost:18211)，后端 [localhost:19211/docs](http://localhost:19211/docs)，MySQL宿主17711。账号 `admin@demo.local`、`analyst@demo.local`、`viewer@demo.local`，密码均 `Demo123!`。`SEED_DEMO=true`启动自动种子；再次执行不新增同编号、不覆盖人工修订。种子包含180独立场次、3场馆、3渠道、4演出、9–10月日期。
+
+## 缺失票款补账（交叉汇总凭证）
+
+历史票款明细丢失时，用凭证补账：每条凭证给出覆盖场次清单与票款总额，场次上已知的票款作为常数，缺失票款（`gross_cents IS NULL`，与真实零元 `0` 严格区分）作为整数变量求值，且每场不得低于退款加渠道费。
+
+- **唯一可解才填回**：每个变量的最小/最大整数可行值相同才判定唯一；入账一次写整批，任一失败整批回滚。
+- **多解**：列出每场可行上下界（整数分），绝不猜测填回。无凭证覆盖的缺失场次只给通用上下界并标注“无覆盖”。
+- **范围与越界凭证**：场次清单独占“待填回”集合；凭证覆盖清单外场次时，若这些场次票款已知则按常数并入右端、凭证继续生效，若含清单外缺失场次则整条排除并在结果中列明原因。
+- **矛盾**：用删除过滤求不可再缩减冲突凭证集（去掉任意一条即可恢复可行），每次剔除保留一个可行见证与 checksum 作为依据；同时列出场次下限冲突。
+- **草稿→求解→入账**：`draft → queued → running → solved/infeasible → posted`，另有 `failed`、`stale`。求解异步执行，期间可继续修订凭证与场次；worker 以 `run_token` 丢弃迟到结果。
+- **过期拒绝**：入账在同一事务内锁定参与场次与凭证，比对冻结快照（含 rev、金额、覆盖清单；范围为“全部”时还比对新增记录），有变化则标记 `stale` 并拒绝写账。
+- **失败恢复与幂等**：失败/过期可沿原任务重试，沿用任务 ID 与范围、按当前数据重新冻结；已入账任务重试或重复入账直接返回，不重复写账。
+- **透视不混半批**：批次中仍有缺失票款时整批拒绝进入透视；已冻结的旧透视读取自己的快照，不受后续补账影响。
+
+API：`GET/POST /vouchers`、`PUT /vouchers/{id}`、`POST /settlements/missing`、`GET/POST /backfills`、`POST /backfills/preview`（只预演不建任务）、`PUT /backfills/{id}`、`POST /backfills/{id}/solve|retry|post`、`GET /backfills/{id}`、`GET /backfills/{id}/export`。
 
 ## 一天的剧本
 
@@ -50,13 +65,13 @@ docker compose exec -T backend python -m scripts.seed_demo
 |---|---|
 |前端|原生ES modules、Noto双字体、OKLCH色板、共用表格/字段/状态组件|
 |服务|Python3.11/FastAPI、SQLAlchemy、PyJWT、Redis队列|
-|持久化|MySQL8 + Redis7 + 共享结果卷|
+|持久化|MySQL8 + Redis7 + 共享结果卷；补账求解用 numpy/scipy(HiGHS) 整数规划|
 |网关|Nginx1.27，同源`/api/`剥离前缀转到后端根路由|
 
-`backend/src`分routes/controllers/services/models/schemas/config/middlewares/utils/constants；`frontend/src`分api/stores/pages/components/hooks/utils/constants/types/router。Settlement、Pivot、Review贯穿数据库/API/页面。请求ID、安全响应头两中间件；写操作审计、全局错误响应。角色ROLES、状态STATES、维度DIMENSIONS、场馆VENUES、渠道CHANNELS：后端`src/constants/enums.py`与`schemas/business.py`，前端`src/constants/enums.js`；算法维度白名单另见后端`services/analysis.py`；持久化列见models/entities.py。
+`backend/src`分routes/controllers/services/models/schemas/config/middlewares/utils/constants；`frontend/src`分api/stores/pages/components/hooks/utils/constants/types/router。Settlement、Voucher、Backfill、Pivot、Review贯穿数据库/API/页面。请求ID、安全响应头两中间件；写操作审计、全局错误响应。角色ROLES、状态STATES、维度DIMENSIONS、场馆VENUES、渠道CHANNELS：后端`src/constants/enums.py`与`schemas/business.py`，前端`src/constants/enums.js`；算法维度白名单另见后端`services/analysis.py`；持久化列见models/entities.py。
 
 5服务frontend/backend/worker/db/redis均有healthcheck。backend等db/redis，worker额外等backend，frontend等backend。MySQL/Redis/结果使用命名卷，worker `/tmp/heartbeat`验证活性，结果落共享 `/artifacts`。`NETWORK_SUBNET=10.253.112.0/24`规避本机默认地址池耗尽，可移机修改；其他环境变量COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO见.env.example。演示密码与JWT密钥部署时替换。
 
-本地开发：先起db/redis，在backend安装requirements并配置DATABASE_URL/REDIS_URL/JWT_SECRET，运行 `uvicorn src.main:app --reload`；前端继续用Nginx同源代理。初表由ORM创建，migrations提供对应初始DDL，无在线版本迁移执行器。清理用 `docker compose down -v --remove-orphans`。
+本地开发：先起db/redis，在backend安装requirements并配置DATABASE_URL/REDIS_URL/JWT_SECRET，运行 `uvicorn src.main:app --reload`；前端继续用Nginx同源代理。初表由ORM创建，migrations提供对应初始DDL（`001_initial.sql` 全量、`002_backfill.sql` 既有库增量），无在线版本迁移执行器。清理用 `docker compose down -v --remove-orphans`。
 
-范围：逐条表单/API录入，无Excel导入、删除/分页或多渠道拆场；仅提供JSON完整导出；回单预期人工输入，不对接银行；本地签核、单worker、Google Fonts离线回退。测试与截图在 `../../test-artifacts/gb-3112/TESTING.md`，不在源码目录。许可证MIT，见LICENSE。
+范围：逐条表单/API录入，无Excel导入、删除/分页或多渠道拆场；凭证覆盖清单为人工录入，不做OCR/对账文件导入；仅提供JSON完整导出；回单预期人工输入，不对接银行；本地签核、单worker、Google Fonts离线回退。测试与截图在 `../../test-artifacts/gb-3112/TESTING.md`，不在源码目录。许可证MIT，见LICENSE。
